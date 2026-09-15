@@ -4,7 +4,8 @@ const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const {
   Client, GatewayIntentBits, Events, EmbedBuilder, ActionRowBuilder, ButtonBuilder,
-  ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, MessageFlags
+  ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, MessageFlags,
+  StringSelectMenuBuilder
 } = require('discord.js');
 
 // This is a standalone strike module/bot entry point. If your existing index.js already
@@ -100,13 +101,220 @@ function managementEmbed(){return new EmbedBuilder().setTitle('Crafted SMP Strik
 function managementRows(){return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('strike:add').setLabel('Add Strikes').setStyle(ButtonStyle.Danger),new ButtonBuilder().setCustomId('strike:remove').setLabel('Remove Strikes').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId('strike:view').setLabel('View Active Strikes').setStyle(ButtonStyle.Secondary))];}
 async function ensurePanel(){const ch=await client.channels.fetch(STRIKE_MANAGEMENT_CHANNEL_ID);if(!ch?.isTextBased())throw new Error('Management channel unavailable');let id=db.prepare(`SELECT value FROM app_state WHERE key='panel_message_id'`).get()?.value;let m=id?await ch.messages.fetch(id).catch(()=>null):null;if(!m){m=await ch.send({embeds:[managementEmbed()],components:managementRows()});db.prepare(`INSERT INTO app_state(key,value) VALUES('panel_message_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(m.id);}else await m.edit({embeds:[managementEmbed()],components:managementRows()});}
 function allowed(i){return i.guildId===GUILD_ID && i.member?.roles?.cache?.has(STAFF_ROLE_ID);}
-function actionModal(kind){const modal=new ModalBuilder().setCustomId(`strike:modal:${kind}`).setTitle(kind==='add'?'Add Strikes':'Remove Strikes');modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('username').setLabel('Minecraft username').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(64)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel(kind==='add'?'Number of strikes':'Number to remove').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000)));return modal;}
+const PAGE_SIZE = 25;
+const allPlayers = () => db.prepare(`
+  SELECT p.uuid, p.username, COALESCE(s.total, 0) AS total
+  FROM players p
+  LEFT JOIN strike_totals s ON s.player_uuid = p.uuid
+  ORDER BY p.username COLLATE NOCASE
+`).all();
+const getPlayerByUuid = db.prepare(`
+  SELECT p.uuid, p.username, COALESCE(s.total, 0) AS total
+  FROM players p
+  LEFT JOIN strike_totals s ON s.player_uuid = p.uuid
+  WHERE p.uuid = ?
+`);
 
-client.once(Events.ClientReady,async()=>{console.log(`Strike system logged in as ${client.user.tag}`);await ensurePanel();await syncAll();});
-client.on(Events.InteractionCreate,async i=>{try{
- if(!i.isButton()&&!i.isModalSubmit())return;if(!allowed(i))return i.reply({content:'You do not have permission to use the strike management panel.',flags:MessageFlags.Ephemeral});
- if(i.isButton()&&i.customId==='strike:add')return i.showModal(actionModal('add')); if(i.isButton()&&i.customId==='strike:remove')return i.showModal(actionModal('remove'));
- if(i.isButton()&&i.customId==='strike:view'){const list=activePlayers();const text=list.length?list.map(p=>`**${p.username}** — ${p.total}`).join('\n'):'No players currently have active strikes.';return i.reply({content:text.slice(0,1900),flags:MessageFlags.Ephemeral});}
- if(i.isModalSubmit()&&i.customId.startsWith('strike:modal:')){const action=i.customId.endsWith(':add')?'add':'remove';const username=i.fields.getTextInputValue('username').trim();const amount=Number(i.fields.getTextInputValue('amount').trim());const reason=i.fields.getTextInputValue('reason').trim();if(!validAmount(amount))return i.reply({content:'Amount must be a whole number from 1 to 1,000,000.',flags:MessageFlags.Ephemeral});const p=getPlayerByName.get(normalizeName(username));if(!p)return i.reply({content:`I do not know Minecraft player **${username}** yet. They must have joined the server at least once so their UUID can be synced.`,flags:MessageFlags.Ephemeral});const r=applyActionTx({actionId:crypto.randomUUID(),playerUuid:p.uuid,username:p.username,action,amount,reason,source:'discord',staffIdentity:`${i.user.tag} (${i.user.id})`});await syncActiveEntry(p.uuid);return i.reply({content:`${action==='add'?'Added':'Removed'} **${r.appliedAmount}** strike(s) ${action==='add'?'to':'from'} **${r.username}**. New total: **${r.newTotal}**.`,flags:MessageFlags.Ephemeral});}
- }catch(e){console.error(e);if(i.isRepliable()&&!i.replied&&!i.deferred)await i.reply({content:'The strike action failed. Check the Railway logs.',flags:MessageFlags.Ephemeral}).catch(()=>{});}});
+function playerPicker(kind, page = 0) {
+  const players = allPlayers();
+  const pageCount = Math.max(1, Math.ceil(players.length / PAGE_SIZE));
+  page = Math.max(0, Math.min(page, pageCount - 1));
+  const shown = players.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  if (!shown.length) {
+    return {
+      content: 'No SMP players have been synced yet. A player will appear here after the Paper plugin has synced their UUID and username.',
+      components: []
+    };
+  }
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`strike:player:${kind}:${page}`)
+    .setPlaceholder('Select an SMP member...')
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(shown.map(p => ({
+      label: p.username.slice(0, 100),
+      description: `Current strikes: ${p.total}`.slice(0, 100),
+      value: p.uuid
+    })));
+
+  const rows = [new ActionRowBuilder().addComponents(menu)];
+
+  if (pageCount > 1) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`strike:players:${kind}:${page - 1}`)
+        .setLabel('Previous')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page === 0),
+      new ButtonBuilder()
+        .setCustomId(`strike:players:${kind}:${page + 1}`)
+        .setLabel('Next')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page >= pageCount - 1)
+    ));
+  }
+
+  return {
+    content: `Select an SMP member. Showing page **${page + 1}/${pageCount}** (${players.length} synced player${players.length === 1 ? '' : 's'}).`,
+    components: rows
+  };
+}
+
+function actionModal(kind, player) {
+  const modal = new ModalBuilder()
+    .setCustomId(`strike:modal:${kind}:${player.uuid}`)
+    .setTitle(`${kind === 'add' ? 'Add Strikes' : 'Remove Strikes'} — ${player.username}`.slice(0, 45));
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('amount')
+        .setLabel(kind === 'add' ? 'Number of strikes' : 'Number to remove')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(7)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('reason')
+        .setLabel('Reason')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000)
+    )
+  );
+
+  return modal;
+}
+
+client.once(Events.ClientReady, async () => {
+  console.log(`Strike system logged in as ${client.user.tag}`);
+  await ensurePanel();
+  await syncAll();
+});
+
+client.on(Events.InteractionCreate, async i => {
+  try {
+    if (!i.isButton() && !i.isStringSelectMenu() && !i.isModalSubmit()) return;
+
+    if (!allowed(i)) {
+      return i.reply({
+        content: 'You do not have permission to use the strike management panel.',
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    if (i.isButton() && i.customId === 'strike:add') {
+      return i.reply({ ...playerPicker('add', 0), flags: MessageFlags.Ephemeral });
+    }
+
+    if (i.isButton() && i.customId === 'strike:remove') {
+      return i.reply({ ...playerPicker('remove', 0), flags: MessageFlags.Ephemeral });
+    }
+
+    if (i.isButton() && i.customId.startsWith('strike:players:')) {
+      const [, , kind, pageRaw] = i.customId.split(':');
+      const page = Number(pageRaw);
+      if (!['add', 'remove'].includes(kind) || !Number.isInteger(page)) {
+        return i.reply({ content: 'Invalid player-list request.', flags: MessageFlags.Ephemeral });
+      }
+      return i.update(playerPicker(kind, page));
+    }
+
+    if (i.isStringSelectMenu() && i.customId.startsWith('strike:player:')) {
+      const [, , kind] = i.customId.split(':');
+      if (!['add', 'remove'].includes(kind)) {
+        return i.reply({ content: 'Invalid strike action.', flags: MessageFlags.Ephemeral });
+      }
+
+      const uuid = i.values[0];
+      const player = getPlayerByUuid.get(uuid);
+      if (!player) {
+        return i.reply({
+          content: 'That SMP player is no longer available in the strike database.',
+          flags: MessageFlags.Ephemeral
+        });
+      }
+
+      return i.showModal(actionModal(kind, player));
+    }
+
+    if (i.isButton() && i.customId === 'strike:view') {
+      const list = activePlayers();
+      const text = list.length
+        ? list.map(p => `**${p.username}** — ${p.total}`).join('\n')
+        : 'No players currently have active strikes.';
+      return i.reply({ content: text.slice(0, 1900), flags: MessageFlags.Ephemeral });
+    }
+
+    if (i.isModalSubmit() && i.customId.startsWith('strike:modal:')) {
+      const parts = i.customId.split(':');
+      const action = parts[2];
+      const uuid = parts.slice(3).join(':');
+
+      if (!['add', 'remove'].includes(action)) {
+        return i.reply({ content: 'Invalid strike action.', flags: MessageFlags.Ephemeral });
+      }
+
+      const player = getPlayerByUuid.get(uuid);
+      if (!player) {
+        return i.reply({
+          content: 'That SMP player could not be found in the strike database.',
+          flags: MessageFlags.Ephemeral
+        });
+      }
+
+      const amountText = i.fields.getTextInputValue('amount').trim();
+      if (!/^\d+$/.test(amountText)) {
+        return i.reply({
+          content: 'Amount must be a positive whole number.',
+          flags: MessageFlags.Ephemeral
+        });
+      }
+
+      const amount = Number(amountText);
+      const reason = i.fields.getTextInputValue('reason').trim();
+
+      if (!validAmount(amount)) {
+        return i.reply({
+          content: 'Amount must be a whole number from 1 to 1,000,000.',
+          flags: MessageFlags.Ephemeral
+        });
+      }
+
+      if (!reason) {
+        return i.reply({ content: 'A reason is required.', flags: MessageFlags.Ephemeral });
+      }
+
+      const r = applyActionTx({
+        actionId: crypto.randomUUID(),
+        playerUuid: player.uuid,
+        username: player.username,
+        action,
+        amount,
+        reason,
+        source: 'discord',
+        staffIdentity: `${i.user.tag} (${i.user.id})`
+      });
+
+      await syncActiveEntry(player.uuid);
+
+      return i.reply({
+        content: `${action === 'add' ? 'Added' : 'Removed'} **${r.appliedAmount}** strike(s) ${action === 'add' ? 'to' : 'from'} **${r.username}**. New total: **${r.newTotal}**.`,
+        flags: MessageFlags.Ephemeral
+      });
+    }
+  } catch (e) {
+    console.error(e);
+    if (i.isRepliable() && !i.replied && !i.deferred) {
+      await i.reply({
+        content: 'The strike action failed. Check the Railway logs.',
+        flags: MessageFlags.Ephemeral
+      }).catch(() => {});
+    }
+  }
+});
+
 client.login(TOKEN);
